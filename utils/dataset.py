@@ -123,6 +123,47 @@ class MultiTextDataset(Dataset):
         }
 
 
+class VideoConditionalDataset(Dataset):
+    """Dataset for video-conditional generation from JSONL file.
+    
+    Each line is a JSON object with:
+        {"video_path": "path/to/video.mp4", "prompt1": "conditioning prompt", "prompt2": "generation prompt"}
+    
+    Args:
+        prompt_path (str): Path to the JSONL file
+        num_conditioning_frames (int): Number of frames to load from video (default: 40)
+        cache_dir (str | None): cache_dir passed to HF Datasets (optional)
+    """
+    
+    def __init__(self, prompt_path: str, num_conditioning_frames: int = 40, cache_dir: str | None = None):
+        self.ds = datasets.load_dataset(
+            "json",
+            data_files=prompt_path,
+            split="train",
+            cache_dir=cache_dir,
+            streaming=False,
+        )
+        
+        assert len(self.ds) > 0, "JSONL is empty"
+        assert "video_path" in self.ds.column_names, "Missing field 'video_path'"
+        assert "prompt1" in self.ds.column_names, "Missing field 'prompt1'"
+        assert "prompt2" in self.ds.column_names, "Missing field 'prompt2'"
+        
+        self.num_conditioning_frames = num_conditioning_frames
+    
+    def __len__(self):
+        return len(self.ds)
+    
+    def __getitem__(self, idx: int):
+        sample = self.ds[idx]
+        return {
+            "idx": idx,
+            "video_path": sample["video_path"],
+            "prompt1": sample["prompt1"],
+            "prompt2": sample["prompt2"],
+        }
+
+
 def cycle(dl):
     while True:
         for data in dl:
