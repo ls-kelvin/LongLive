@@ -68,3 +68,5 @@ val_data_path: prompts/vidprom_filtered_extended.txt
 min_num_training_frames: 21
 num_training_frames: 21
 slice_last_frames: 21
+clear_context: false
+memorize: false

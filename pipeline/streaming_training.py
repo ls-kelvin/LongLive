@@ -43,6 +43,7 @@ class StreamingTrainingPipeline:
         self.crossattn_cache = None
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
+        self.clear_context = bool(kwargs.get("clear_context", False))
 
         self.local_attn_size = kwargs.get("local_attn_size", -1)
 
@@ -50,6 +51,20 @@ class StreamingTrainingPipeline:
         self.kv_cache_size = (self.local_attn_size + slice_last_frames) * self.frame_seq_length
         if DEBUG:
             print(f"[KV policy] local_attn_size={self.local_attn_size} slice_last_frames={slice_last_frames} -> kv_frames={self.kv_cache_size}")
+
+    def _get_cache_conditional_dict(self, conditional_dict: dict) -> dict:
+        if not self.clear_context:
+            return conditional_dict
+
+        empty_prompt_embeds = conditional_dict.get("clear_context_prompt_embeds", None)
+        if empty_prompt_embeds is None:
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print("[SeqTrain-Pipeline] clear_context=True but clear_context_prompt_embeds is missing, fallback to original context")
+            return conditional_dict
+
+        cache_conditional_dict = dict(conditional_dict)
+        cache_conditional_dict["prompt_embeds"] = empty_prompt_embeds
+        return cache_conditional_dict
     
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -219,11 +234,12 @@ class StreamingTrainingPipeline:
             
             if DEBUG and block_index == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Pipeline] Updating cache with context_noise={self.context_noise}")
-            
+
+            cache_conditional_dict = self._get_cache_conditional_dict(conditional_dict)
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=context_noisy,
-                    conditional_dict=conditional_dict,
+                    conditional_dict=cache_conditional_dict,
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
@@ -302,6 +318,9 @@ class StreamingTrainingPipeline:
                     blk["global_end_index"].zero_()
                 if "local_end_index" in blk:
                     blk["local_end_index"].zero_()
+                for key in ("memorize_pending_starts", "memorize_frame_starts", "memorize_k_list", "memorize_v_list"):
+                    if key in blk:
+                        blk[key] = []
 
         # Clear cross-attention cache
         if getattr(self, "crossattn_cache", None) is not None:

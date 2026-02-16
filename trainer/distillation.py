@@ -813,6 +813,27 @@ class Trainer:
             self.one_logger.on_save_checkpoint_success(global_step=self.step)
             self.one_logger.on_save_checkpoint_end(global_step=self.step)
 
+    def _get_clear_context_conditional_dict(self, batch_size: int) -> dict:
+        cached = getattr(self, "_clear_context_conditional_dict", None)
+        if cached is not None and cached["prompt_embeds"].shape[0] == batch_size:
+            return cached
+
+        with torch.no_grad():
+            empty_conditional_dict = self.model.text_encoder(
+                text_prompts=[""] * batch_size
+            )
+        empty_conditional_dict = {k: v.detach() for k, v in empty_conditional_dict.items()}
+        self._clear_context_conditional_dict = empty_conditional_dict
+        return empty_conditional_dict
+
+    def _attach_clear_context_embeds(self, conditional_dict: dict, batch_size: int) -> dict:
+        if not getattr(self.config, "clear_context", False):
+            return conditional_dict
+
+        empty_conditional_dict = self._get_clear_context_conditional_dict(batch_size)
+        conditional_dict["clear_context_prompt_embeds"] = empty_conditional_dict["prompt_embeds"]
+        return conditional_dict
+
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
@@ -830,6 +851,7 @@ class Trainer:
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
                 text_prompts=text_prompts)
+            conditional_dict = self._attach_clear_context_embeds(conditional_dict, batch_size)
 
             if not getattr(self, "unconditional_dict", None):
                 unconditional_dict = self.model.text_encoder(
@@ -975,6 +997,7 @@ class Trainer:
         
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
+            conditional_dict = self._attach_clear_context_embeds(conditional_dict, batch_size)
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Trainer] Created and cached conditional_dict")
             if not getattr(self, "unconditional_dict", None):
@@ -1024,6 +1047,7 @@ class Trainer:
                 switch_conditional_dict = self.model.text_encoder(
                     text_prompts=batch["switch_prompts"]
                 )
+                switch_conditional_dict = self._attach_clear_context_embeds(switch_conditional_dict, batch_size)
             switch_frame_index = self._get_switch_frame_index(temp_max_length)
             
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):

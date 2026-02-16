@@ -90,6 +90,8 @@ streaming_max_length: 240
 
 streaming_min_new_frame: 18
 train_first_chunk: true
+clear_context: false
+memorize: false
 
 last_step_only: false
 

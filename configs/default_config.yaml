@@ -8,6 +8,8 @@ i2v: false
 num_training_frames: 21
 gc_interval: 100
 context_noise: 0
+clear_context: false
+memorize: false
 causal: true
 
 ckpt_step: 0

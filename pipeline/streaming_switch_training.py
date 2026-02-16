@@ -208,10 +208,11 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 context_timestep.flatten(0, 1),
             ).unflatten(0, denoised_pred.shape[:2])
             
+            cache_conditional_dict = self._get_cache_conditional_dict(cond_in_use)
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=context_noisy,
-                    conditional_dict=cond_in_use,
+                    conditional_dict=cache_conditional_dict,
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
@@ -301,10 +302,11 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         self.generator.model.block_mask = block_mask
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"current_start_frame: {current_start_frame}, num_recache_frames: {num_recache_frames}")
+        recache_conditional_dict = self._get_cache_conditional_dict(new_conditional_dict)
         with torch.no_grad():
             self.generator(
                 noisy_image_or_video=frames_to_recache,
-                conditional_dict=new_conditional_dict,
+                conditional_dict=recache_conditional_dict,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,

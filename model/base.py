@@ -29,8 +29,10 @@ class BaseModel(nn.Module):
     def _initialize_models(self, args, device):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
-        self.local_attn_size = getattr(args, "model_kwargs", {}).get("local_attn_size", -1)
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+        model_kwargs = dict(getattr(args, "model_kwargs", {}))
+        model_kwargs.setdefault("memorize", getattr(args, "memorize", False))
+        self.local_attn_size = model_kwargs.get("local_attn_size", -1)
+        self.generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
         self.generator.model.requires_grad_(True)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
@@ -239,6 +241,7 @@ class SelfForcingModel(BaseModel):
             last_step_only=self.args.last_step_only,
             num_max_frames=num_training_frames,
             context_noise=self.args.context_noise,
+            clear_context=getattr(self.args, "clear_context", False),
             local_attn_size=local_attn_size,
             slice_last_frames=slice_last_frames,
             num_training_frames=num_training_frames,
