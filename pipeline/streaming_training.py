@@ -48,7 +48,10 @@ class StreamingTrainingPipeline:
         self.local_attn_size = kwargs.get("local_attn_size", -1)
 
         slice_last_frames: int = int(kwargs.get("slice_last_frames", 21))
-        self.kv_cache_size = (self.local_attn_size + slice_last_frames) * self.frame_seq_length
+        if int(self.local_attn_size) == 0:
+            self.kv_cache_size = 0
+        else:
+            self.kv_cache_size = (self.local_attn_size + slice_last_frames) * self.frame_seq_length
         if DEBUG:
             print(f"[KV policy] local_attn_size={self.local_attn_size} slice_last_frames={slice_last_frames} -> kv_frames={self.kv_cache_size}")
 

@@ -242,6 +242,7 @@ class CausalWanSelfAttention(nn.Module):
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
+            direct_memorize_kv = []
             if self.memorize:
                 # `memorize=True` ignores sink_size and uses an explicit permanent memory bank.
                 sink_tokens = 0
@@ -255,9 +256,11 @@ class CausalWanSelfAttention(nn.Module):
                 is_new_append = current_end > global_end_index
                 if is_new_append:
                     frame_starts_to_add = []
+                    frame_offsets_to_add = []
                     if self.memory_indices_rule is None:
                         # Backward-compatible default: memorize the first frame of each generated block.
                         frame_starts_to_add.append(int(current_start))
+                        frame_offsets_to_add.append(0)
                     else:
                         period, offset = self.memory_indices_rule
                         num_current_frames = roped_query.shape[1] // frame_seqlen
@@ -265,10 +268,20 @@ class CausalWanSelfAttention(nn.Module):
                             frame_idx = current_start_frame + frame_offset
                             if frame_idx % period == offset:
                                 frame_starts_to_add.append(int(frame_idx * frame_seqlen))
+                                frame_offsets_to_add.append(frame_offset)
 
-                    for frame_start in frame_starts_to_add:
+                    for frame_start, frame_offset in zip(frame_starts_to_add, frame_offsets_to_add):
                         if (frame_start not in kv_cache["memorize_pending_starts"]) and (frame_start not in kv_cache["memorize_frame_starts"]):
-                            kv_cache["memorize_pending_starts"].append(frame_start)
+                            if self.local_attn_size == 0:
+                                token_start = frame_offset * frame_seqlen
+                                token_end = token_start + frame_seqlen
+                                direct_memorize_kv.append((
+                                    frame_start,
+                                    roped_key[:, token_start:token_end].clone(),
+                                    v[:, token_start:token_end].clone(),
+                                ))
+                            else:
+                                kv_cache["memorize_pending_starts"].append(frame_start)
 
                 if self.local_attn_size != -1:
                     local_window_start_global = current_end - self.local_attn_size * frame_seqlen
@@ -297,137 +310,13 @@ class CausalWanSelfAttention(nn.Module):
             if self.memorize and kv_cache.get("memorize_k_list", None):
                 memorized_k = torch.cat(kv_cache["memorize_k_list"], dim=1)
                 memorized_v = torch.cat(kv_cache["memorize_v_list"], dim=1)
-            # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-            kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
-            # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-            #     print("***********before attention***********")
-            #     print(f"kv_cache_size = {kv_cache_size / frame_seqlen}")
-            #     print(f"torch.is_grad_enabled() = {torch.is_grad_enabled()}")
-            #     print(f"current_end = {current_end / frame_seqlen}")
-            #     print(f"current_start = {current_start / frame_seqlen}")
-            #     print(f"kv_cache['global_end_index'] = {kv_cache['global_end_index']}")
-            #     print(f"kv_cache['local_end_index'] = {kv_cache['local_end_index']}")
-            #     print(f"num_new_tokens = {num_new_tokens}")
-
-            # Compute cache update parameters without modifying kv_cache directly
-            cache_update_info = None
-            is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-                #     print(f"need roll")
-                #     print(f"num_rolled_tokens: {num_rolled_tokens / frame_seqlen}")
-                #     print(f"num_evicted_tokens: {num_evicted_tokens / frame_seqlen}")
-                #     print(f"sink_tokens: {sink_tokens / frame_seqlen}")
-
-                # Compute updated local indices
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
-                local_start_index = local_end_index - num_new_tokens
-
-                # Construct full k, v for attention computation (without modifying the original cache)
-                # Create temporary k, v for computation
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
-                
-                # Apply rolling update to the temporary cache
-                temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                
-                # Insert new key/value into the temporary cache
-                # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
-                write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
-                roped_offset = max(0, write_start_index - local_start_index)
-                write_len = max(0, local_end_index - write_start_index)
-                if write_len > 0:
-                    temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
-                    temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
-
-                # Save cache update info for later use
-                cache_update_info = {
-                    "action": "roll_and_insert",
-                    "sink_tokens": sink_tokens,
-                    "num_rolled_tokens": num_rolled_tokens,
-                    "num_evicted_tokens": num_evicted_tokens,
-                    "local_start_index": local_start_index,
-                    "local_end_index": local_end_index,
-                    "write_start_index": write_start_index,
-                    "write_end_index": local_end_index,
-                    "new_k": roped_key[:, roped_offset:roped_offset + write_len],
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
-                    "current_end": current_end,
-                    "is_recompute": is_recompute
-                }
-
-                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-                #     print(f"used kv cache size: local_end_index - local_start_index = {local_end_index - local_start_index}")
-            else:
-                # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-                local_start_index = local_end_index - num_new_tokens
-
-                # Construct full k, v for attention computation (without modifying the original cache)
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
-                # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
-                write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
-                if sink_recache_after_switch:
-                    write_start_index = local_start_index
-                roped_offset = max(0, write_start_index - local_start_index)
-                write_len = max(0, local_end_index - write_start_index)
-                if write_len > 0:
-                    temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
-                    temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
-
-                # Save cache update info for later use
-                cache_update_info = {
-                    "action": "direct_insert",
-                    "local_start_index": local_start_index,
-                    "local_end_index": local_end_index,
-                    "write_start_index": write_start_index,
-                    "write_end_index": local_end_index,
-                    "new_k": roped_key[:, roped_offset:roped_offset + write_len],
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
-                    "current_end": current_end,
-                    "is_recompute": is_recompute
-                }
-
-            # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-            #     print(f"local_start_index: {local_start_index}, local_end_index: {local_end_index}")
-
-            # Use temporary k, v to compute attention
-            if sink_tokens > 0:
-                # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
-                local_budget = self.max_attention_size - sink_tokens
-                k_sink = temp_k[:, :sink_tokens]
-                v_sink = temp_v[:, :sink_tokens]
-                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-                #     print(f"local_budget: {local_budget}")
-                if local_budget > 0:
-                    local_start_for_window = max(sink_tokens, local_end_index - local_budget)
-                    k_local = temp_k[:, local_start_for_window:local_end_index]
-                    v_local = temp_v[:, local_start_for_window:local_end_index]
-                    k_cat = torch.cat([k_sink, k_local], dim=1)
-                    v_cat = torch.cat([v_sink, v_local], dim=1)
-                else:
-                    k_cat = k_sink
-                    v_cat = v_sink
-                x = attention(
-                    roped_query,
-                    k_cat,
-                    v_cat
-                )
-            else:
-                window_start = max(0, local_end_index - self.max_attention_size)
-                k_window = temp_k[:, window_start:local_end_index]
-                v_window = temp_v[:, window_start:local_end_index]
+            if self.local_attn_size == 0:
+                # local_attn_size=0 means no persistent local KV cache.
+                # We attend over permanent memory (if any) plus the current block only.
+                local_end_index = 0
+                is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
+                k_window = roped_key
+                v_window = v
                 if memorized_k is not None:
                     k_window = torch.cat([memorized_k, k_window], dim=1)
                     v_window = torch.cat([memorized_v, v_window], dim=1)
@@ -436,6 +325,158 @@ class CausalWanSelfAttention(nn.Module):
                     k_window,
                     v_window
                 )
+                cache_update_info = {
+                    "action": "no_local",
+                    "is_recompute": is_recompute
+                }
+            else:
+                # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
+                kv_cache_size = kv_cache["k"].shape[1]
+                num_new_tokens = roped_query.shape[1]
+                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                #     print("***********before attention***********")
+                #     print(f"kv_cache_size = {kv_cache_size / frame_seqlen}")
+                #     print(f"torch.is_grad_enabled() = {torch.is_grad_enabled()}")
+                #     print(f"current_end = {current_end / frame_seqlen}")
+                #     print(f"current_start = {current_start / frame_seqlen}")
+                #     print(f"kv_cache['global_end_index'] = {kv_cache['global_end_index']}")
+                #     print(f"kv_cache['local_end_index'] = {kv_cache['local_end_index']}")
+                #     print(f"num_new_tokens = {num_new_tokens}")
+
+                # Compute cache update parameters without modifying kv_cache directly
+                cache_update_info = None
+                is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
+                if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+                        num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+                    # Calculate the number of new tokens added in this step
+                    # Shift existing cache content left to discard oldest tokens
+                    num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+                    num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+                    # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                    #     print(f"need roll")
+                    #     print(f"num_rolled_tokens: {num_rolled_tokens / frame_seqlen}")
+                    #     print(f"num_evicted_tokens: {num_evicted_tokens / frame_seqlen}")
+                    #     print(f"sink_tokens: {sink_tokens / frame_seqlen}")
+
+                    # Compute updated local indices
+                    local_end_index = kv_cache["local_end_index"].item() + current_end - \
+                        kv_cache["global_end_index"].item() - num_evicted_tokens
+                    local_start_index = local_end_index - num_new_tokens
+
+                    # Construct full k, v for attention computation (without modifying the original cache)
+                    # Create temporary k, v for computation
+                    temp_k = kv_cache["k"].clone()
+                    temp_v = kv_cache["v"].clone()
+                    
+                    # Apply rolling update to the temporary cache
+                    temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    
+                    # Insert new key/value into the temporary cache
+                    # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
+                    write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
+                    roped_offset = max(0, write_start_index - local_start_index)
+                    write_len = max(0, local_end_index - write_start_index)
+                    if write_len > 0:
+                        temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
+                        temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+
+                    # Save cache update info for later use
+                    cache_update_info = {
+                        "action": "roll_and_insert",
+                        "sink_tokens": sink_tokens,
+                        "num_rolled_tokens": num_rolled_tokens,
+                        "num_evicted_tokens": num_evicted_tokens,
+                        "local_start_index": local_start_index,
+                        "local_end_index": local_end_index,
+                        "write_start_index": write_start_index,
+                        "write_end_index": local_end_index,
+                        "new_k": roped_key[:, roped_offset:roped_offset + write_len],
+                        "new_v": v[:, roped_offset:roped_offset + write_len],
+                        "current_end": current_end,
+                        "is_recompute": is_recompute
+                    }
+
+                    # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                    #     print(f"used kv cache size: local_end_index - local_start_index = {local_end_index - local_start_index}")
+                else:
+                    # Assign new keys/values directly up to current_end
+                    local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                    local_start_index = local_end_index - num_new_tokens
+
+                    # Construct full k, v for attention computation (without modifying the original cache)
+                    temp_k = kv_cache["k"].clone()
+                    temp_v = kv_cache["v"].clone()
+                    # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
+                    write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
+                    if sink_recache_after_switch:
+                        write_start_index = local_start_index
+                    roped_offset = max(0, write_start_index - local_start_index)
+                    write_len = max(0, local_end_index - write_start_index)
+                    if write_len > 0:
+                        temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
+                        temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+
+                    # Save cache update info for later use
+                    cache_update_info = {
+                        "action": "direct_insert",
+                        "local_start_index": local_start_index,
+                        "local_end_index": local_end_index,
+                        "write_start_index": write_start_index,
+                        "write_end_index": local_end_index,
+                        "new_k": roped_key[:, roped_offset:roped_offset + write_len],
+                        "new_v": v[:, roped_offset:roped_offset + write_len],
+                        "current_end": current_end,
+                        "is_recompute": is_recompute
+                    }
+
+                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                #     print(f"local_start_index: {local_start_index}, local_end_index: {local_end_index}")
+
+                # Use temporary k, v to compute attention
+                if sink_tokens > 0:
+                    # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
+                    local_budget = self.max_attention_size - sink_tokens
+                    k_sink = temp_k[:, :sink_tokens]
+                    v_sink = temp_v[:, :sink_tokens]
+                    # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                    #     print(f"local_budget: {local_budget}")
+                    if local_budget > 0:
+                        local_start_for_window = max(sink_tokens, local_end_index - local_budget)
+                        k_local = temp_k[:, local_start_for_window:local_end_index]
+                        v_local = temp_v[:, local_start_for_window:local_end_index]
+                        k_cat = torch.cat([k_sink, k_local], dim=1)
+                        v_cat = torch.cat([v_sink, v_local], dim=1)
+                    else:
+                        k_cat = k_sink
+                        v_cat = v_sink
+                    x = attention(
+                        roped_query,
+                        k_cat,
+                        v_cat
+                    )
+                else:
+                    window_start = max(0, local_end_index - self.max_attention_size)
+                    k_window = temp_k[:, window_start:local_end_index]
+                    v_window = temp_v[:, window_start:local_end_index]
+                    if memorized_k is not None:
+                        k_window = torch.cat([memorized_k, k_window], dim=1)
+                        v_window = torch.cat([memorized_v, v_window], dim=1)
+                    x = attention(
+                        roped_query,
+                        k_window,
+                        v_window
+                    )
+
+            if self.memorize and self.local_attn_size == 0 and direct_memorize_kv:
+                for frame_start, frame_k, frame_v in direct_memorize_kv:
+                    if frame_start in kv_cache["memorize_frame_starts"]:
+                        continue
+                    kv_cache["memorize_k_list"].append(frame_k)
+                    kv_cache["memorize_v_list"].append(frame_v)
+                    kv_cache["memorize_frame_starts"].append(frame_start)
 
         # output
         x = x.flatten(2)
@@ -766,7 +807,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 frame_seqlen * num_frame_per_block
 
         def attention_mask(b, h, q_idx, kv_idx):
-            if local_attn_size == -1:
+            if local_attn_size in (-1, 0):
                 return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
             else:
                 return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | (q_idx == kv_idx)
@@ -913,7 +954,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 frame_seqlen * num_frame_per_block
 
         def attention_mask(b, h, q_idx, kv_idx):
-            if local_attn_size == -1:
+            if local_attn_size in (-1, 0):
                 return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
             else:
                 return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | \

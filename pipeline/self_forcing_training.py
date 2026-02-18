@@ -67,6 +67,8 @@ class SelfForcingTrainingPipeline:
                 return min(base + slice_last_frames, num_training_frames)
             else:
                 base = int(local_cfg)
+                if base == 0:
+                    return 0
                 return min(base + slice_last_frames, num_training_frames)
 
         kv_frames = _resolve_kv_frames(self.local_attn_size)

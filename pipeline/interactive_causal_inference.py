@@ -52,6 +52,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             return
         
         num_recache_frames = current_start_frame if self.local_attn_size == -1 else min(self.local_attn_size, current_start_frame)
+        if num_recache_frames == 0:
+            return
         recache_start_frame = current_start_frame - num_recache_frames
         
         frames_to_recache = output[:, recache_start_frame:current_start_frame]
