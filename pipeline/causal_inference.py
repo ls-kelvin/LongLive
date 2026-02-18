@@ -23,8 +23,10 @@ class CausalInferencePipeline(torch.nn.Module):
         # Step 1: Initialize all models
         if DEBUG:
             print(f"args.model_kwargs: {args.model_kwargs}")
+        model_kwargs = dict(getattr(args, "model_kwargs", {}))
+        model_kwargs.setdefault("memorize", getattr(args, "memorize", False))
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
+            **model_kwargs, is_causal=True) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = WanVAEWrapper() if vae is None else vae
 
@@ -44,6 +46,8 @@ class CausalInferencePipeline(torch.nn.Module):
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = args.model_kwargs.local_attn_size
+        self.clear_context = bool(getattr(args, "clear_context", False))
+        self.memorize = bool(getattr(args, "memorize", False))
 
         # Normalize to list if sequence-like (e.g., OmegaConf ListConfig)
 
@@ -52,6 +56,39 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+    def _get_clear_context_conditional_dict(self, batch_size: int) -> dict:
+        cached = getattr(self, "_clear_context_conditional_dict", None)
+        if cached is not None and cached["prompt_embeds"].shape[0] == batch_size:
+            return cached
+
+        with torch.no_grad():
+            empty_conditional_dict = self.text_encoder(text_prompts=[""] * batch_size)
+        empty_conditional_dict = {k: v.detach() for k, v in empty_conditional_dict.items()}
+        self._clear_context_conditional_dict = empty_conditional_dict
+        return empty_conditional_dict
+
+    def _attach_clear_context_embeds(self, conditional_dict: dict, batch_size: int) -> dict:
+        if not self.clear_context:
+            return conditional_dict
+
+        empty_conditional_dict = self._get_clear_context_conditional_dict(batch_size)
+        conditional_dict["clear_context_prompt_embeds"] = empty_conditional_dict["prompt_embeds"]
+        return conditional_dict
+
+    def _get_cache_conditional_dict(self, conditional_dict: dict) -> dict:
+        if not self.clear_context:
+            return conditional_dict
+
+        empty_prompt_embeds = conditional_dict.get("clear_context_prompt_embeds", None)
+        if empty_prompt_embeds is None:
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print("[inference] clear_context=True but clear_context_prompt_embeds is missing, fallback to original context")
+            return conditional_dict
+
+        cache_conditional_dict = dict(conditional_dict)
+        cache_conditional_dict["prompt_embeds"] = empty_prompt_embeds
+        return cache_conditional_dict
 
     def inference(
         self,
@@ -80,6 +117,7 @@ class CausalInferencePipeline(torch.nn.Module):
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
+        conditional_dict = self._attach_clear_context_embeds(conditional_dict, batch_size)
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -190,9 +228,10 @@ class CausalInferencePipeline(torch.nn.Module):
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
             # Step 2.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            cache_conditional_dict = self._get_cache_conditional_dict(conditional_dict)
             self.generator(
                 noisy_image_or_video=denoised_pred,
-                conditional_dict=conditional_dict,
+                conditional_dict=cache_conditional_dict,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,

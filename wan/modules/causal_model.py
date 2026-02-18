@@ -67,6 +67,7 @@ class CausalWanSelfAttention(nn.Module):
                  num_heads,
                  local_attn_size=-1,
                  sink_size=0,
+                 memorize=False,
                  qk_norm=True,
                  eps=1e-6):
         assert dim % num_heads == 0
@@ -76,6 +77,7 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        self.memorize = memorize
         self.qk_norm = qk_norm
         self.eps = eps
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
@@ -212,6 +214,49 @@ class CausalWanSelfAttention(nn.Module):
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
+            if self.memorize:
+                # `memorize=True` ignores sink_size and uses an explicit permanent memory bank.
+                sink_tokens = 0
+                if "memorize_pending_starts" not in kv_cache:
+                    kv_cache["memorize_pending_starts"] = []
+                    kv_cache["memorize_frame_starts"] = []
+                    kv_cache["memorize_k_list"] = []
+                    kv_cache["memorize_v_list"] = []
+
+                global_end_index = kv_cache["global_end_index"].item()
+                is_new_append = current_end > global_end_index
+                if is_new_append:
+                    frame_start = int(current_start)
+                    if (frame_start not in kv_cache["memorize_pending_starts"]) and (frame_start not in kv_cache["memorize_frame_starts"]):
+                        kv_cache["memorize_pending_starts"].append(frame_start)
+
+                if self.local_attn_size != -1:
+                    local_window_start_global = current_end - self.local_attn_size * frame_seqlen
+                    cache_global_end = int(kv_cache["global_end_index"].item())
+                    cache_local_end = int(kv_cache["local_end_index"].item())
+                    cache_global_start = cache_global_end - cache_local_end
+                    next_pending_starts = []
+                    for frame_start in kv_cache["memorize_pending_starts"]:
+                        if frame_start >= local_window_start_global:
+                            # Still covered by local attention, don't duplicate into permanent memory yet.
+                            next_pending_starts.append(frame_start)
+                            continue
+
+                        local_idx_start = frame_start - cache_global_start
+                        local_idx_end = local_idx_start + frame_seqlen
+                        if local_idx_start >= 0 and local_idx_end <= cache_local_end:
+                            kv_cache["memorize_k_list"].append(
+                                kv_cache["k"][:, local_idx_start:local_idx_end].clone())
+                            kv_cache["memorize_v_list"].append(
+                                kv_cache["v"][:, local_idx_start:local_idx_end].clone())
+                            kv_cache["memorize_frame_starts"].append(frame_start)
+                    kv_cache["memorize_pending_starts"] = next_pending_starts
+
+            memorized_k = None
+            memorized_v = None
+            if self.memorize and kv_cache.get("memorize_k_list", None):
+                memorized_k = torch.cat(kv_cache["memorize_k_list"], dim=1)
+                memorized_v = torch.cat(kv_cache["memorize_v_list"], dim=1)
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
@@ -341,10 +386,15 @@ class CausalWanSelfAttention(nn.Module):
                 )
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
+                k_window = temp_k[:, window_start:local_end_index]
+                v_window = temp_v[:, window_start:local_end_index]
+                if memorized_k is not None:
+                    k_window = torch.cat([memorized_k, k_window], dim=1)
+                    v_window = torch.cat([memorized_v, v_window], dim=1)
                 x = attention(
                     roped_query,
-                    temp_k[:, window_start:local_end_index],
-                    temp_v[:, window_start:local_end_index]
+                    k_window,
+                    v_window
                 )
 
         # output
@@ -367,6 +417,7 @@ class CausalWanAttentionBlock(nn.Module):
                  num_heads,
                  local_attn_size=-1,
                  sink_size=0,
+                 memorize=False,
                  qk_norm=True,
                  cross_attn_norm=False,
                  eps=1e-6):
@@ -381,7 +432,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, memorize, qk_norm, eps)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -522,6 +573,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  num_layers=32,
                  local_attn_size=-1,
                  sink_size=0,
+                 memorize=False,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -555,6 +607,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Window size for temporal local attention (-1 indicates global attention)
             sink_size (`int`, *optional*, defaults to 0):
                 Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
+            memorize (`bool`, *optional*, defaults to False):
+                Preserve the first frame of each generated chunk in a permanent KV memory once it leaves local attention.
             qk_norm (`bool`, *optional*, defaults to True):
                 Enable query/key normalization
             cross_attn_norm (`bool`, *optional*, defaults to False):
@@ -579,6 +633,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.local_attn_size = local_attn_size
+        self.memorize = memorize
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
@@ -599,7 +654,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
+                                    local_attn_size, sink_size, memorize, qk_norm, cross_attn_norm, eps)
             for _ in range(num_layers)
         ])
 

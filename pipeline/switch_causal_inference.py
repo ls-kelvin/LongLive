@@ -73,19 +73,20 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
             local_attn_size=self.local_attn_size
         )
 
-        context_timestep = torch.ones([batch_size, recompute_frames], 
+        context_timestep = torch.ones([batch_size, num_recache_frames], 
                                     device=device, dtype=torch.int64) * self.args.context_noise
         
         self.generator.model.block_mask = block_mask
+        recache_conditional_dict = self._get_cache_conditional_dict(new_conditional_dict)
             
         with torch.no_grad():
             self.generator(
-                noisy_image_or_video=frames_to_recompute,
-                conditional_dict=new_conditional_dict,
+                noisy_image_or_video=frames_to_recache,
+                conditional_dict=recache_conditional_dict,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
-                current_start=recompute_start_frame * self.frame_seq_length,
+                current_start=recache_start_frame * self.frame_seq_length,
             )
 
         # reset cross-attention cache
@@ -119,6 +120,8 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
         # Encode both prompts upfront
         cond_first = self.text_encoder(text_prompts=text_prompts_first)
         cond_second = self.text_encoder(text_prompts=text_prompts_second)
+        cond_first = self._attach_clear_context_embeds(cond_first, batch_size)
+        cond_second = self._attach_clear_context_embeds(cond_second, batch_size)
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -212,9 +215,10 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
 
             # rerun with clean context noise for cache update
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            cache_conditional_dict = self._get_cache_conditional_dict(cond_in_use)
             self.generator(
                 noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_in_use,
+                conditional_dict=cache_conditional_dict,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,

@@ -79,9 +79,10 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         
         # recache
         with torch.no_grad():
+            recache_conditional_dict = self._get_cache_conditional_dict(new_conditional_dict)
             self.generator(
                 noisy_image_or_video=frames_to_recache,
-                conditional_dict=new_conditional_dict,
+                conditional_dict=recache_conditional_dict,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
@@ -126,6 +127,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         # encode all prompts
         print(text_prompts_list)
         cond_list = [self.text_encoder(text_prompts=p) for p in text_prompts_list]
+        cond_list = [self._attach_clear_context_embeds(c, batch_size) for c in cond_list]
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -248,9 +250,10 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
             # rerun with clean context to update cache
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            cache_conditional_dict = self._get_cache_conditional_dict(cond_in_use)
             self.generator(
                 noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_in_use,
+                conditional_dict=cache_conditional_dict,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
