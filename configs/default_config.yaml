@@ -10,6 +10,7 @@ gc_interval: 100
 context_noise: 0
 clear_context: false
 memorize: false
+memory_indices: null
 causal: true
 
 ckpt_step: 0

@@ -17,6 +17,7 @@ from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
 import torch
 import math
+import re
 import torch.distributed as dist
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
 
@@ -68,6 +69,7 @@ class CausalWanSelfAttention(nn.Module):
                  local_attn_size=-1,
                  sink_size=0,
                  memorize=False,
+                 memory_indices=None,
                  qk_norm=True,
                  eps=1e-6):
         assert dim % num_heads == 0
@@ -78,6 +80,10 @@ class CausalWanSelfAttention(nn.Module):
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         self.memorize = memorize
+        self.memory_indices = memory_indices
+        self.memory_indices_rule = None
+        if self.memorize and self.memory_indices is not None:
+            self.memory_indices_rule = self._parse_memory_indices(self.memory_indices)
         self.qk_norm = qk_norm
         self.eps = eps
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
@@ -95,6 +101,28 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+    @staticmethod
+    def _parse_memory_indices(memory_indices):
+        if not isinstance(memory_indices, str):
+            raise ValueError(
+                f"memory_indices must be a string like '3n' or '3n+2', got {type(memory_indices).__name__}"
+            )
+        match = re.fullmatch(r"\s*(\d+)\s*n(?:\s*\+\s*(\d+))?\s*", memory_indices)
+        if match is None:
+            raise ValueError(
+                f"Invalid memory_indices='{memory_indices}'. Expected format like '3n' or '3n+2'."
+            )
+
+        period = int(match.group(1))
+        offset = int(match.group(2)) if match.group(2) is not None else 0
+        if period <= 0:
+            raise ValueError(f"Invalid memory_indices='{memory_indices}': period must be > 0.")
+        if offset < 0 or offset >= period:
+            raise ValueError(
+                f"Invalid memory_indices='{memory_indices}': offset must satisfy 0 <= offset < period."
+            )
+        return period, offset
 
     def forward(
         self,
@@ -226,9 +254,21 @@ class CausalWanSelfAttention(nn.Module):
                 global_end_index = kv_cache["global_end_index"].item()
                 is_new_append = current_end > global_end_index
                 if is_new_append:
-                    frame_start = int(current_start)
-                    if (frame_start not in kv_cache["memorize_pending_starts"]) and (frame_start not in kv_cache["memorize_frame_starts"]):
-                        kv_cache["memorize_pending_starts"].append(frame_start)
+                    frame_starts_to_add = []
+                    if self.memory_indices_rule is None:
+                        # Backward-compatible default: memorize the first frame of each generated block.
+                        frame_starts_to_add.append(int(current_start))
+                    else:
+                        period, offset = self.memory_indices_rule
+                        num_current_frames = roped_query.shape[1] // frame_seqlen
+                        for frame_offset in range(num_current_frames):
+                            frame_idx = current_start_frame + frame_offset
+                            if frame_idx % period == offset:
+                                frame_starts_to_add.append(int(frame_idx * frame_seqlen))
+
+                    for frame_start in frame_starts_to_add:
+                        if (frame_start not in kv_cache["memorize_pending_starts"]) and (frame_start not in kv_cache["memorize_frame_starts"]):
+                            kv_cache["memorize_pending_starts"].append(frame_start)
 
                 if self.local_attn_size != -1:
                     local_window_start_global = current_end - self.local_attn_size * frame_seqlen
@@ -418,6 +458,7 @@ class CausalWanAttentionBlock(nn.Module):
                  local_attn_size=-1,
                  sink_size=0,
                  memorize=False,
+                 memory_indices=None,
                  qk_norm=True,
                  cross_attn_norm=False,
                  eps=1e-6):
@@ -432,7 +473,9 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, memorize, qk_norm, eps)
+        self.self_attn = CausalWanSelfAttention(
+            dim, num_heads, local_attn_size, sink_size, memorize, memory_indices, qk_norm, eps
+        )
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -574,6 +617,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  local_attn_size=-1,
                  sink_size=0,
                  memorize=False,
+                 memory_indices=None,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -609,6 +653,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
             memorize (`bool`, *optional*, defaults to False):
                 Preserve the first frame of each generated chunk in a permanent KV memory once it leaves local attention.
+            memory_indices (`str`, *optional*, defaults to None):
+                Pattern that selects which global latent frame indices enter permanent memory, e.g. "3n" or "3n+2".
+                Only used when `memorize=True`. If None, behavior is backward-compatible and memorizes block starts.
             qk_norm (`bool`, *optional*, defaults to True):
                 Enable query/key normalization
             cross_attn_norm (`bool`, *optional*, defaults to False):
@@ -634,6 +681,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_layers = num_layers
         self.local_attn_size = local_attn_size
         self.memorize = memorize
+        self.memory_indices = memory_indices
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
@@ -654,7 +702,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, memorize, qk_norm, cross_attn_norm, eps)
+                                    local_attn_size, sink_size, memorize, memory_indices, qk_norm, cross_attn_norm, eps)
             for _ in range(num_layers)
         ])
 

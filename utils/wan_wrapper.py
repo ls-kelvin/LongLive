@@ -177,6 +177,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             local_attn_size=-1,
             sink_size=0,
             memorize=False,
+            memory_indices=None,
             use_infinite_attention=False
     ):
         super().__init__()
@@ -187,7 +188,12 @@ class WanDiffusionWrapper(torch.nn.Module):
                     f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
             else:
                 self.model = CausalWanModel.from_pretrained(
-                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size, memorize=memorize)
+                    f"wan_models/{model_name}/",
+                    local_attn_size=local_attn_size,
+                    sink_size=sink_size,
+                    memorize=memorize,
+                    memory_indices=memory_indices,
+                )
         else:
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()

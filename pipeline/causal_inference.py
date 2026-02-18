@@ -25,6 +25,7 @@ class CausalInferencePipeline(torch.nn.Module):
             print(f"args.model_kwargs: {args.model_kwargs}")
         model_kwargs = dict(getattr(args, "model_kwargs", {}))
         model_kwargs.setdefault("memorize", getattr(args, "memorize", False))
+        model_kwargs.setdefault("memory_indices", getattr(args, "memory_indices", None))
         self.generator = WanDiffusionWrapper(
             **model_kwargs, is_causal=True) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder

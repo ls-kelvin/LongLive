@@ -31,6 +31,7 @@ class BaseModel(nn.Module):
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
         model_kwargs = dict(getattr(args, "model_kwargs", {}))
         model_kwargs.setdefault("memorize", getattr(args, "memorize", False))
+        model_kwargs.setdefault("memory_indices", getattr(args, "memory_indices", None))
         self.local_attn_size = model_kwargs.get("local_attn_size", -1)
         self.generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
         self.generator.model.requires_grad_(True)
